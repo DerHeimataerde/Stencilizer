@@ -39,15 +39,15 @@ python stencilizer.py input.png --layers 2 --outdir output --gpu --min-island-si
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--layers` | 3 | Number of stencil layers to generate |
+| `--layers` | 2 | Number of stencil layers to generate |
 | `--outdir` | output | Output directory |
 | `--invert` | off | Invert input (use if foreground is white) |
 | `--threshold` | 128 | Binarization threshold (0-255) |
 | `--bridge-width` | 1 | Bridge width in pixels |
-| `--smooth-iterations` | 2 | Chaikin smoothing passes for curved bridges |
+| `--smooth-iterations` | 0 | Chaikin smoothing passes for curved bridges |
 | `--no-smooth` | off | Disable curved bridges (straight lines only) |
 | `--min-island-size` | 1 | Minimum island size in pixels (smaller ignored) |
-| `--erode-passes` | 1 | Erosion passes for island detection (higher = catches more diagonal/thin wall islands) |
+| `--erode-passes` | 0 | Erosion passes for island detection (higher = catches more diagonal/thin wall islands) |
 | `--bridges-per-island` | 1 | Number of bridges per island (more = stronger support) |
 | `--gpu` | off | Use GPU acceleration via CuPy |
 | `--verbose` | off | Enable verbose logging |
