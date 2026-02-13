@@ -32,16 +32,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-python stencilizer.py input.png --layers 3 --outdir output
-```
-
-### GPU mode (optional)
-
-Requires an NVIDIA GPU with CUDA and CuPy installed.
-
-```
-pip install cupy-cuda12x
-python stencilizer.py input.png --layers 3 --outdir output --gpu
+python stencilizer.py input.png --layers 2 --outdir output --gpu --min-island-size 2 --erode-passes 1 --bridges-per-island 2 --bridge-width 2 --smooth-iterations 3 --verbose --log log.txt
 ```
 
 ### Options

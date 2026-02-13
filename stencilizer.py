@@ -1,7 +1,6 @@
 import argparse
 import logging
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple, cast
 
@@ -9,12 +8,6 @@ import numpy as np
 from PIL import Image
 
 Coord = Tuple[int, int]
-
-
-@dataclass
-class BridgeResult:
-    path: List[Coord]
-    relaxed: bool
 
 
 def load_binary_image(path: Path, invert: bool = False, threshold: int = 128) -> np.ndarray:
@@ -370,6 +363,15 @@ def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
+def blend_overlay(base: np.ndarray, mask: np.ndarray, color: tuple, alpha: float = 0.75) -> np.ndarray:
+    """Blend a semi-transparent color onto base image where mask is True."""
+    result = base.copy().astype(np.float32)
+    overlay_color = np.array(color[:3], dtype=np.float32)
+    result[mask, :3] = result[mask, :3] * (1 - alpha) + overlay_color * alpha
+    result[mask, 3] = 255  # Ensure full opacity in output
+    return result.astype(np.uint8)
+
+
 def rasterize_path(
     path: Sequence[Coord],
     shape: Tuple[int, int],
@@ -438,7 +440,6 @@ def compute_bridge_path(
 def generate_layers(
     foreground: np.ndarray,
     layers: int,
-    max_relax_per_hole: int = 1,
     smooth: bool = True,
     smooth_iterations: int = 2,
     bridge_width: int = 1,
@@ -802,7 +803,6 @@ def _gpu_bfs_path(
 def generate_layers_gpu(
     foreground,
     layers: int,
-    max_relax_per_hole: int = 1,
     smooth: bool = True,
     smooth_iterations: int = 2,
     bridge_width: int = 1,
@@ -1140,7 +1140,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create multiple stencil layers to avoid holes while preserving the original silhouette when overlayed."
     )
-    parser.add_argument("input", type=Path, help="Input monochrome PNG or BMP")
+    parser.add_argument("input", type=Path, help="Input image (PNG, BMP, JPEG, etc.)")
     parser.add_argument("--layers", type=int, default=3, help="Number of stencil layers to generate")
     parser.add_argument("--outdir", type=Path, default=Path("output"), help="Output directory")
     parser.add_argument("--invert", action="store_true", help="Invert input if white is foreground")
@@ -1227,15 +1227,6 @@ def main() -> None:
     # Load original image for overlays
     original_img = Image.open(args.input).convert("RGBA")
     original_rgba = np.array(original_img)
-
-    # Helper for semi-transparent overlay blending
-    def blend_overlay(base: np.ndarray, mask: np.ndarray, color: tuple, alpha: float = 0.75) -> np.ndarray:
-        """Blend a semi-transparent color onto base image where mask is True."""
-        result = base.copy().astype(np.float32)
-        overlay_color = np.array(color[:3], dtype=np.float32)
-        result[mask, :3] = result[mask, :3] * (1 - alpha) + overlay_color * alpha
-        result[mask, 3] = 255  # Ensure full opacity in output
-        return result.astype(np.uint8)
 
     # Save islands image showing detected islands overlayed on original
     islands_path = args.outdir / "islands.png"
