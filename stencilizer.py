@@ -6,6 +6,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple, cast
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 Coord = Tuple[int, int]
 
@@ -402,6 +403,47 @@ def rasterize_path(
     return dilate_mask(mask, bridge_width)
 
 
+def rasterize_path_gpu(
+    path: Sequence[Coord],
+    shape: Tuple[int, int],
+    smooth: bool,
+    smooth_iterations: int,
+    bridge_width: int,
+    cp_module,
+    cndi_module,
+):
+    """GPU version of rasterize_path - keeps data on GPU."""
+    if not path:
+        return cp_module.zeros(shape, dtype=bool)
+    
+    # Skip smoothing for very short paths
+    if smooth and len(path) >= 4:
+        compressed = compress_path(path)
+        points = [(float(r), float(c)) for r, c in compressed]
+        spline_points = catmull_rom_spline(points, num_segments=8)
+        if smooth_iterations > 0:
+            spline_points = chaikin_smooth(spline_points, smooth_iterations)
+        # Rasterize on CPU then transfer (spline math is CPU-bound anyway)
+        mask_cpu = rasterize_polyline(spline_points, shape)
+        mask = cp_module.asarray(mask_cpu)
+    else:
+        # No smoothing: set pixels directly on GPU
+        mask = cp_module.zeros(shape, dtype=bool)
+        for r, c in path:
+            if 0 <= r < shape[0] and 0 <= c < shape[1]:
+                mask[r, c] = True
+    
+    # GPU dilation using cupyx.scipy.ndimage (much faster than CPU)
+    if bridge_width > 1:
+        # Build circular structuring element
+        size = 2 * bridge_width - 1
+        y, x = cp_module.ogrid[-bridge_width+1:bridge_width, -bridge_width+1:bridge_width]
+        struct = (x*x + y*y) < bridge_width * bridge_width
+        mask = cndi_module.binary_dilation(mask, structure=struct)
+    
+    return mask
+
+
 def compute_bridge_path(
     boundary_black: Sequence[Coord],
     outer_black: Set[Coord],
@@ -498,7 +540,7 @@ def generate_layers(
     
     # Compute all bridge paths first
     bridge_masks: List[np.ndarray] = []
-    for island_index, island in enumerate(islands):
+    for island_index, island in enumerate(tqdm(islands, desc="Building bridges", unit="island")):
         boundary_black = list(compute_boundary_black(island, foreground))
         if not boundary_black:
             logging.debug("Island %d (size=%d) has no adjacent foreground pixels", island_index, len(island))
@@ -650,6 +692,137 @@ def generate_layers(
         all_bridges_mask = all_bridges_mask | bridge_mask
 
     return layer_images, warnings, islands_mask, all_bridges_mask
+
+
+def _gpu_compute_distance_field(targets_mask, foreground, cp_module, cndi_module):
+    """Compute geodesic distance field from targets through foreground.
+    
+    Returns distance field where each foreground pixel has its shortest distance
+    to any target pixel (only traveling through foreground).
+    Uses 8-connectivity for diagonal paths.
+    """
+    # Use iterative wavefront expansion to compute geodesic distance
+    # This is equivalent to BFS but computes distances for ALL pixels at once
+    height, width = foreground.shape
+    
+    # Initialize: targets are distance 0, everything else is infinity
+    INF = height * width + 1
+    dist = cp_module.full(foreground.shape, INF, dtype=cp_module.int32)
+    dist[targets_mask] = 0
+    
+    # Traversable = foreground OR targets (targets may not be in foreground)
+    traversable = foreground | targets_mask
+    
+    # Wavefront expansion with 8-connectivity
+    changed = True
+    while changed:
+        changed = False
+        
+        # 4-connectivity (orthogonal) - distance +1
+        # Up neighbor
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[1:, :] = dist[:-1, :] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # Down neighbor
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[:-1, :] = dist[1:, :] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # Left neighbor
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[:, 1:] = dist[:, :-1] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # Right neighbor
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[:, :-1] = dist[:, 1:] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # 8-connectivity (diagonal) - also distance +1 (Chebyshev distance)
+        # Up-left
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[1:, 1:] = dist[:-1, :-1] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # Up-right
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[1:, :-1] = dist[:-1, 1:] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # Down-left
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[:-1, 1:] = dist[1:, :-1] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+        
+        # Down-right
+        new_dist = cp_module.full_like(dist, INF)
+        new_dist[:-1, :-1] = dist[1:, 1:] + 1
+        improved = (new_dist < dist) & traversable
+        if cp_module.any(improved):
+            dist = cp_module.where(improved, new_dist, dist)
+            changed = True
+    
+    return dist
+
+
+def _trace_path_from_distance_cpu(start_r: int, start_c: int, dist_cpu: np.ndarray, targets_cpu: np.ndarray) -> List[Coord]:
+    """Trace a path from start to targets by following decreasing distance values (CPU version)."""
+    height, width = dist_cpu.shape
+    INF = height * width + 1
+    
+    path = [(start_r, start_c)]
+    r, c = start_r, start_c
+    
+    # 8-connectivity neighbors (including diagonals)
+    neighbors_8 = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    
+    # Follow gradient descent
+    max_steps = height * width  # Safety limit
+    for _ in range(max_steps):
+        if targets_cpu[r, c]:
+            break
+        
+        # Find neighbor with smallest distance (8-connectivity)
+        best_dist = dist_cpu[r, c]
+        best_r, best_c = r, c
+        
+        for dr, dc in neighbors_8:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < height and 0 <= nc < width:
+                if dist_cpu[nr, nc] < best_dist:
+                    best_dist = dist_cpu[nr, nc]
+                    best_r, best_c = nr, nc
+        
+        if best_r == r and best_c == c:
+            # Can't make progress - stuck
+            break
+        
+        r, c = best_r, best_c
+        path.append((r, c))
+    
+    return path
 
 
 def _gpu_bfs_path(
@@ -922,6 +1095,10 @@ def generate_layers_gpu(
     logging.info("Found %d interior detail(s) (islands), %d after size filter (min=%d px), erode_passes=%d (GPU)", 
                  total_islands, islands_count, min_island_size, erode_passes)
 
+    # Warn if few islands - CPU may be faster due to reduced transfer overhead
+    if islands_count > 0 and islands_count < 50:
+        logging.warning("Few islands detected (%d). CPU mode (without --gpu) may be faster for small island counts.", islands_count)
+
     # Compute outer boundary: foreground pixels adjacent to background that touches border
     # First, find background pixels that can reach the border (outside region)
     outside_bg = background.copy()
@@ -961,26 +1138,45 @@ def generate_layers_gpu(
     warnings: List[str] = []
     failed_count = 0
     
-    # Compute all bridge paths first
+    # Compute distance field ONCE from all targets (much faster than per-island BFS)
+    logging.info("Computing distance field for bridge pathfinding...")
+    dist_field = _gpu_compute_distance_field(all_targets, foreground, cp, cndi)
+    dist_field_cpu = cp.asnumpy(dist_field)
+    targets_cpu = cp.asnumpy(all_targets)
+    height_img, width_img = foreground.shape
+    INF = height_img * width_img + 1
+    
+    # Free GPU memory for distance field since we have the CPU copy
+    del dist_field
+    cp.get_default_memory_pool().free_all_blocks()
+    
+    # Get labels on CPU for efficient iteration
+    labels_cpu = cp.asnumpy(labels)
+    
+    # Compute all bridge paths using distance field (keep masks on CPU to save GPU memory)
     import math
-    bridge_masks: List = []
-    for label_id in island_labels_list:
-        island_mask = labels == label_id
-        boundary_black = foreground & cndi.binary_dilation(island_mask, structure=structure_8conn)
+    bridge_masks: List[np.ndarray] = []
+    for label_id in tqdm(island_labels_list, desc="Building bridges (GPU)", unit="island"):
+        island_mask_cpu = labels_cpu == label_id
+        
+        # Dilate on CPU (scipy is fast enough for small islands)
+        from scipy import ndimage as ndi_cpu
+        structure_8conn_cpu = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=bool)
+        dilated = ndi_cpu.binary_dilation(island_mask_cpu, structure=structure_8conn_cpu)
+        foreground_cpu = cp.asnumpy(foreground)
+        boundary_black_cpu = foreground_cpu & dilated
         
         # Fallback: use island pixels directly if no adjacent foreground
-        has_boundary = bool(cp.any(boundary_black))
+        has_boundary = np.any(boundary_black_cpu)
         if not has_boundary:
             logging.debug("Island %d (GPU) has no adjacent foreground pixels", label_id)
-            boundary_black = island_mask
+            boundary_black_cpu = island_mask_cpu
         
         # Get island pixels for centroid calculation
-        island_coords = cp.argwhere(island_mask)
-        island_coords_cpu = cp.asnumpy(island_coords)
+        island_coords_cpu = np.argwhere(island_mask_cpu)
         
         # Get boundary pixels  
-        boundary_coords = cp.argwhere(boundary_black)
-        boundary_coords_cpu = cp.asnumpy(boundary_coords)
+        boundary_coords_cpu = np.argwhere(boundary_black_cpu)
         
         island_bridge_count = 0
         
@@ -1022,40 +1218,31 @@ def generate_layers_gpu(
                     _, coord = boundary_with_angle[best_idx]
                     selected_boundaries.append(coord)
             
-            used_targets_cpu: Set[Coord] = set()
-            
             for coord in selected_boundaries:
-                # Create boundary mask for this single pixel
-                group_boundary_mask = cp.zeros_like(foreground, dtype=bool)
-                group_boundary_mask[coord[0], coord[1]] = True
+                r, c = coord
+                # Check if this boundary pixel can reach a target (distance < INF)
+                if dist_field_cpu[r, c] >= INF:
+                    continue
                 
-                # Exclude used targets
-                available_targets = all_targets.copy()
-                for r, c in used_targets_cpu:
-                    available_targets[r, c] = False
-                if not cp.any(available_targets):
-                    available_targets = all_targets
+                # If already on a target, island is directly connected - no bridge needed
+                if targets_cpu[r, c]:
+                    island_bridge_count += 1  # Count as success - already connected
+                    continue
                 
-                path = _gpu_bfs_path(group_boundary_mask, available_targets, foreground, use_8conn=False)
-                if path is None:
-                    path = _gpu_bfs_path(group_boundary_mask, available_targets, foreground, use_8conn=True)
-                if path is None:
-                    allowed_any = cp.ones_like(foreground, dtype=bool)
-                    path = _gpu_bfs_path(group_boundary_mask, available_targets, allowed_any, use_8conn=True)
+                # Trace path using precomputed distance field
+                path = _trace_path_from_distance_cpu(r, c, dist_field_cpu, targets_cpu)
                 
-                if path is not None:
+                if path and len(path) > 1:
                     island_bridge_count += 1
-                    if path:
-                        used_targets_cpu.add(path[-1])
                     
-                    path_mask_cpu = rasterize_path(
+                    path_mask = rasterize_path(
                         path,
-                        foreground.shape,
+                        (height_img, width_img),
                         smooth=smooth,
                         smooth_iterations=smooth_iterations,
                         bridge_width=bridge_width,
                     )
-                    bridge_masks.append(cp.asarray(path_mask_cpu))
+                    bridge_masks.append(path_mask)
             
             if island_bridge_count > 0:
                 logging.debug("Island %d (size=%d, GPU) bridged with %d paths", 
@@ -1064,33 +1251,52 @@ def generate_layers_gpu(
                 failed_count += 1
                 logging.debug("Island %d (size=%d, GPU) could not find any bridge path", 
                              label_id, len(island_coords_cpu))
-                bridge_masks.append(cp.zeros_like(foreground, dtype=bool))
+                bridge_masks.append(np.zeros((height_img, width_img), dtype=bool))
         else:
-            # Single bridge (original behavior)
-            path = _gpu_bfs_path(boundary_black, all_targets, foreground, use_8conn=False)
-            if path is None:
-                path = _gpu_bfs_path(boundary_black, all_targets, foreground, use_8conn=True)
-            if path is None:
-                allowed_any = cp.ones_like(foreground, dtype=bool)
-                path = _gpu_bfs_path(boundary_black, all_targets, allowed_any, use_8conn=True)
+            # Single bridge - find boundary pixel with minimum distance to target
+            # Find the boundary pixel closest to a target
+            best_r, best_c = -1, -1
+            best_dist = INF
+            for coord in boundary_coords_cpu:
+                r, c = int(coord[0]), int(coord[1])
+                if dist_field_cpu[r, c] < best_dist:
+                    best_dist = dist_field_cpu[r, c]
+                    best_r, best_c = r, c
             
-            if path is None:
+            if best_r < 0 or best_dist >= INF:
                 failed_count += 1
                 logging.debug("Island %d (size=%d, GPU) could not find bridge path", 
                              label_id, len(island_coords_cpu))
-                bridge_masks.append(cp.zeros_like(foreground, dtype=bool))
+                bridge_masks.append(np.zeros((height_img, width_img), dtype=bool))
+                continue
+            
+            # If already on a target, island is directly connected - no bridge needed
+            if targets_cpu[best_r, best_c]:
+                logging.debug("Island %d (size=%d, GPU) already connected to boundary", 
+                             label_id, len(island_coords_cpu))
+                bridge_masks.append(np.zeros((height_img, width_img), dtype=bool))
+                continue
+            
+            # Trace path using distance field
+            path = _trace_path_from_distance_cpu(best_r, best_c, dist_field_cpu, targets_cpu)
+            
+            if not path or len(path) < 2:
+                failed_count += 1
+                logging.debug("Island %d (size=%d, GPU) could not trace bridge path", 
+                             label_id, len(island_coords_cpu))
+                bridge_masks.append(np.zeros((height_img, width_img), dtype=bool))
                 continue
             
             logging.debug("Island %d (size=%d, GPU) bridged with path of length %d", 
                          label_id, len(island_coords_cpu), len(path))
-            path_mask_cpu = rasterize_path(
+            path_mask = rasterize_path(
                 path,
-                foreground.shape,
+                (height_img, width_img),
                 smooth=smooth,
                 smooth_iterations=smooth_iterations,
                 bridge_width=bridge_width,
             )
-            bridge_masks.append(cp.asarray(path_mask_cpu))
+            bridge_masks.append(path_mask)
     
     # Assign bridges to fill-in layers (layers 2..N)
     fill_layers = layers - 1 if layers > 1 else 1
@@ -1099,14 +1305,17 @@ def generate_layers_gpu(
         fill_layer = bridge_index % fill_layers
         bridge_assignments[fill_layer].append(bridge_index)
     
+    # Convert bridge masks to GPU for layer assembly (one-time transfer at end)
+    bridge_masks_gpu = [cp.asarray(bm) for bm in bridge_masks]
+    
     layer_images: List = []
     
     # Layer 1: Full design + all islands + ALL bridges
     logging.info("Building layer 1/%d (main design with bridges) (GPU)", layers)
     layer1 = ~foreground.copy()  # Design as holes (False = paint through)
     # Add all bridges as stencil material
-    for bridge_mask in bridge_masks:
-        layer1 = layer1 | bridge_mask
+    for bridge_mask_gpu in bridge_masks_gpu:
+        layer1 = layer1 | bridge_mask_gpu
     layer_images.append(layer1)
     
     # Layers 2..N: Only bridge areas as holes
@@ -1121,7 +1330,7 @@ def generate_layers_gpu(
         
         # Only the assigned bridges become holes
         for bridge_index in bridge_assignments[fill_idx]:
-            layer_img = layer_img & ~bridge_masks[bridge_index]
+            layer_img = layer_img & ~bridge_masks_gpu[bridge_index]
         
         layer_images.append(layer_img)
 
@@ -1130,8 +1339,8 @@ def generate_layers_gpu(
 
     # Combine all bridge masks into single mask for visualization
     all_bridges_mask = cp.zeros(foreground.shape, dtype=bool)
-    for bridge_mask in bridge_masks:
-        all_bridges_mask = all_bridges_mask | bridge_mask
+    for bridge_mask_gpu in bridge_masks_gpu:
+        all_bridges_mask = all_bridges_mask | bridge_mask_gpu
 
     return layer_images, warnings, islands_mask, all_bridges_mask
 
