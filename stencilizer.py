@@ -343,15 +343,24 @@ def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     """Dilate mask with circular kernel for smooth bridge edges."""
     if radius <= 1:
         return mask
-    
+    # If mask is a cupy array, use cupyx.scipy.ndimage
+    try:
+        import cupy as cp
+        import cupyx.scipy.ndimage as cndi
+        if isinstance(mask, cp.ndarray):
+            diameter = 2 * radius - 1
+            y, x = cp.ogrid[:diameter, :diameter]
+            center = radius - 1
+            structure = (x - center) ** 2 + (y - center) ** 2 < radius * radius
+            return cndi.binary_dilation(mask, structure=structure)
+    except ImportError:
+        pass
+    # Fallback to CPU (numpy/scipy)
     from scipy import ndimage as ndi_cpu
-    
-    # Build circular structuring element (disk)
     diameter = 2 * radius - 1
     y, x = np.ogrid[:diameter, :diameter]
     center = radius - 1
     structure = ((x - center) ** 2 + (y - center) ** 2) < radius * radius
-    
     return ndi_cpu.binary_dilation(mask, structure=structure)
 
 
