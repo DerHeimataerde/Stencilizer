@@ -71,7 +71,7 @@ The following files are written to the output directory:
 | ``bridges.png`` | All bridges (blue) overlayed on original |
 | ``cutouts.png`` | Foreground regions after regular bridges, each in a random colour |
 | ``structural.png`` | Oversized regions (coloured) + structural bridges (pink) overlayed on original |
-| ``struct_bridges.png`` | Incremental structural bridge progress, updated live during generation |
+| ``struct_bridges.png`` | Structural bridges (pink) overlaid on original, saved after generation completes |
 | ``diff.png`` | Differences (red) overlayed on original |
 | ``log.txt`` | Console output (only with ``--log``) |
 

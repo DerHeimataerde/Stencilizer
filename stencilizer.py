@@ -798,26 +798,25 @@ def generate_layers(
     total_layers = 1 + fill_layers + (1 if structural_masks else 0)
     layer_images: List[np.ndarray] = []
 
-    # Layer 1: full design + regular bridges + structural bridges (all solid)
-    logging.info("Building layer 1/%d (main design with bridges)", total_layers)
+    # Layer 0: full design + regular bridges + structural bridges (all solid)
+    logging.info("Building base layer (layer_0_base.png) [1/%d]", total_layers)
     layer1 = ~foreground.copy()
     layer1 = layer1 | all_regular_bridges | structural_mask
     layer_images.append(layer1)
 
-    # Layers 2..N: regular bridge fill-in (round-robin)
+    # Bridge fill layers (round-robin)
     for fill_idx in range(fill_layers):
         if layers == 1:
             break
-        layer_num = fill_idx + 2
-        logging.info("Building layer %d/%d (regular bridge fill-in)", layer_num, total_layers)
+        logging.info("Building bridge layer %d/%d (layer_%d_bridges.png)", fill_idx + 1, fill_layers, fill_idx + 2)
         layer_img = np.ones((height, width), dtype=bool)
         for bridge_index in bridge_assignments[fill_idx]:
             layer_img = layer_img & ~bridge_masks[bridge_index]
         layer_images.append(layer_img)
 
-    # Dedicated structural fill layer (last)
+    # Structural fill layer (last)
     if structural_masks:
-        logging.info("Building layer %d/%d (structural bridge fill-in)", total_layers, total_layers)
+        logging.info("Building structural layer (layer_1_structural.png) [%d/%d]", total_layers, total_layers)
         struct_layer = np.ones((height, width), dtype=bool)
         for sm in structural_masks:
             struct_layer = struct_layer & ~sm
@@ -987,7 +986,7 @@ def _compute_structural_bridges(
         # bridges (clipped to each region_mask) cannot affect one another.
         # Process all of them in a single pass and relabel only once per round.
         any_inserted = False
-        for fg_coords in tqdm(oversized, desc=f"Structural bridges (iter {iteration})", unit="region", leave=False):
+        for fg_coords in tqdm(oversized, desc=f"Structural bridges (iter {iteration})", unit="region", leave=True):
             region_mask = np.zeros((height, width), dtype=bool)
             region_mask[fg_coords[:, 0], fg_coords[:, 1]] = True
             mid_mask = _best_chord(fg_coords, region_mask)
@@ -1511,7 +1510,7 @@ def generate_layers_gpu(
         else:
             batch_connected_dilated = batch_connected
         
-        for label_id in tqdm(layer_islands, desc=f"Building bridges (layer {fill_layer_idx + 2})", unit="island"):
+        for label_id in tqdm(layer_islands, desc=f"Bridge layer {fill_layer_idx + 1}/{fill_layers}", unit="island"):
             # Use precomputed bounding box for this island
             bbox = island_slices[label_id - 1]
             if bbox is None:
@@ -1719,8 +1718,8 @@ def generate_layers_gpu(
     total_layers = 1 + fill_layers + (1 if has_structural else 0)
     layer_images: List = []
 
-    # Layer 1: full design + regular bridges + structural bridges (all solid)
-    logging.info("Building layer 1/%d (main design with bridges) (GPU)", total_layers)
+    # Layer 0: full design + regular bridges + structural bridges (all solid)
+    logging.info("Building base layer (layer_0_base.png) [1/%d] (GPU)", total_layers)
     layer1 = ~foreground.copy()
     layer1 = layer1 | all_bridges_gpu | structural_gpu
     layer_images.append(layer1)
@@ -1730,7 +1729,7 @@ def generate_layers_gpu(
         if layers == 1:
             break
         layer_num = fill_idx + 2
-        logging.info("Building layer %d/%d (regular bridge fill-in) (GPU)", layer_num, total_layers)
+        logging.info("Building bridge layer %d/%d (layer_%d_bridges.png) (GPU)", fill_idx + 1, fill_layers, fill_idx + 2)
 
         layer_img = ~fill_layer_accums_gpu[fill_idx]
 
@@ -1753,7 +1752,7 @@ def generate_layers_gpu(
 
     # Dedicated structural fill layer (last)
     if has_structural:
-        logging.info("Building layer %d/%d (structural bridge fill-in) (GPU)", total_layers, total_layers)
+        logging.info("Building structural layer (layer_1_structural.png) [%d/%d] (GPU)", total_layers, total_layers)
         layer_images.append(~structural_gpu)
 
     if failed_count > 0:
