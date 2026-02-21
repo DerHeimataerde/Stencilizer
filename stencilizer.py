@@ -966,21 +966,22 @@ def _compute_structural_bridges(
 
     for iteration in range(1, max_iterations + 1):
         labels, count = _ndi.label(working, structure=_structure_8)
-        oversized = sorted(
-            [np.argwhere(labels == lbl)
-             for lbl in range(1, count + 1)
-             if (labels == lbl).sum() > max_cutout_size],
-            key=len, reverse=True,
+        # Use bincount for O(H*W) size calculation instead of O(count*H*W)
+        label_sizes = np.bincount(labels.ravel(), minlength=count + 1)
+        oversized_lbls = sorted(
+            [lbl for lbl in range(1, count + 1) if label_sizes[lbl] > max_cutout_size],
+            key=lambda lbl: label_sizes[lbl], reverse=True,
         )
-        if not oversized:
+        if not oversized_lbls:
             tqdm.write(f"[INFO] max-cutout-size: done after {iteration - 1} iteration(s), all regions within threshold")
             break
-        tqdm.write(f"[INFO] max-cutout-size iteration {iteration}: {len(oversized)} region(s) above {max_cutout_size} px")
-        # All oversized regions are disjoint connected components; process all
-        # in a single pass and relabel only once per round.
+        tqdm.write(f"[INFO] max-cutout-size iteration {iteration}: {len(oversized_lbls)} region(s) above {max_cutout_size} px")
+        # Bar is created before any heavy work so it renders 0% immediately.
+        # np.argwhere + _best_chord both happen inside the bar.
         any_inserted = False
-        pbar = tqdm(total=len(oversized), desc=f"Structural bridges (iter {iteration})", unit="region", leave=True, mininterval=0.05, miniters=1, dynamic_ncols=True)
-        for fg_coords in oversized:
+        pbar = tqdm(total=len(oversized_lbls), desc=f"Structural bridges (iter {iteration})", unit="region", leave=True, mininterval=0.05, miniters=1, dynamic_ncols=True)
+        for lbl in oversized_lbls:
+            fg_coords = np.argwhere(labels == lbl)
             region_mask = np.zeros((height, width), dtype=bool)
             region_mask[fg_coords[:, 0], fg_coords[:, 1]] = True
             mid_mask = _best_chord(fg_coords, region_mask)
