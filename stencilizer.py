@@ -383,6 +383,42 @@ def get_disk_offsets(radius: int) -> np.ndarray:
     return offsets
 
 
+def compute_thick_path_pixels(
+    path: Sequence[Coord],
+    radius: int,
+    smooth: bool,
+    smooth_iterations: int,
+    shape: Tuple[int, int],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return (rs, cs) integer arrays of all pixels covered by a thick path.
+
+    Vectorised: uses numpy broadcasting instead of nested Python loops.
+    Returns (None, None) for an empty/invalid path.
+    """
+    if not path or radius <= 0:
+        return None, None
+    height, width = shape
+    offsets = get_disk_offsets(radius)  # (O, 2)
+
+    if smooth and len(path) >= 4:
+        compressed = compress_path(path)
+        points = [(float(r), float(c)) for r, c in compressed]
+        spline_points = catmull_rom_spline(points, num_segments=8)
+        if smooth_iterations > 0:
+            spline_points = chaikin_smooth(spline_points, smooth_iterations)
+        path_arr = np.array(
+            [(int(round(p[0])), int(round(p[1]))) for p in spline_points], dtype=np.int32
+        )
+    else:
+        path_arr = np.asarray(path, dtype=np.int32)  # (N, 2)
+
+    # Broadcast: path_arr[:, 0:1] is (N,1), offsets[:,0] is (O,) → (N,O) → ravel
+    pts_r = (path_arr[:, 0:1] + offsets[:, 0]).ravel()
+    pts_c = (path_arr[:, 1:2] + offsets[:, 1]).ravel()
+    valid = (pts_r >= 0) & (pts_r < height) & (pts_c >= 0) & (pts_c < width)
+    return pts_r[valid], pts_c[valid]
+
+
 def draw_thick_path_into_mask(
     mask: np.ndarray,
     path: Sequence[Coord],
@@ -390,30 +426,10 @@ def draw_thick_path_into_mask(
     smooth: bool = False,
     smooth_iterations: int = 0,
 ) -> None:
-    """Draw thick path by stamping circles at each point. Much faster than dilation for sparse paths."""
-    if not path or radius <= 0:
-        return
-    
-    height, width = mask.shape
-    offsets = get_disk_offsets(radius)
-    
-    # Get path points (apply smoothing if needed)
-    if smooth and len(path) >= 4:
-        compressed = compress_path(path)
-        points = [(float(r), float(c)) for r, c in compressed]
-        spline_points = catmull_rom_spline(points, num_segments=8)
-        if smooth_iterations > 0:
-            spline_points = chaikin_smooth(spline_points, smooth_iterations)
-        path_points = [(int(round(p[0])), int(round(p[1]))) for p in spline_points]
-    else:
-        path_points = list(path)
-    
-    # Stamp circles at each path point
-    for r, c in path_points:
-        for dr, dc in offsets:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < height and 0 <= nc < width:
-                mask[nr, nc] = True
+    """Draw thick path into mask (vectorised via compute_thick_path_pixels)."""
+    rs, cs = compute_thick_path_pixels(path, radius, smooth, smooth_iterations, mask.shape)
+    if rs is not None:
+        mask[rs, cs] = True
 
 
 def blend_overlay(base: np.ndarray, mask: np.ndarray, color: tuple, alpha: float = 0.75) -> np.ndarray:
@@ -1534,76 +1550,56 @@ def generate_layers_gpu(
             boundary_coords_cpu = boundary_coords_local + np.array([r_start, c_start])
             
             island_bridge_count = 0
-            
+            img_shape = (height_img, width_img)
+
             if bridges_per_island > 1 and len(boundary_coords_cpu) >= bridges_per_island:
-                # Compute centroid for multi-bridge placement
+                # Vectorised angle selection
                 centroid_r = float(island_coords_cpu[:, 0].mean())
                 centroid_c = float(island_coords_cpu[:, 1].mean())
-                
-                # Compute angle for each boundary pixel
-                boundary_with_angle = []
-                for coord in boundary_coords_cpu:
-                    r, c = int(coord[0]), int(coord[1])
-                    angle = math.atan2(r - centroid_r, c - centroid_c)
-                    boundary_with_angle.append((angle, (r, c)))
-                boundary_with_angle.sort(key=lambda x: x[0])
-                
-                # Select boundary pixels at evenly-spaced angles
-                target_angles = [(-math.pi + (2 * math.pi * i / bridges_per_island)) for i in range(bridges_per_island)]
-                
+                angles = np.arctan2(
+                    boundary_coords_cpu[:, 0] - centroid_r,
+                    boundary_coords_cpu[:, 1] - centroid_c,
+                )
+                sort_idx = np.argsort(angles)
+                sorted_angles = angles[sort_idx]
+                sorted_coords = boundary_coords_cpu[sort_idx]
+                target_angles = [-math.pi + (2 * math.pi * i / bridges_per_island) for i in range(bridges_per_island)]
                 selected_boundaries: List[Tuple[int, int]] = []
-                used_indices: Set[int] = set()
-                
+                used_sel = np.zeros(len(sorted_angles), dtype=bool)
                 for target_angle in target_angles:
-                    best_idx = -1
-                    best_diff = float('inf')
-                    for idx, (angle, _) in enumerate(boundary_with_angle):
-                        if idx in used_indices:
-                            continue
-                        diff = abs(angle - target_angle)
-                        if diff > math.pi:
-                            diff = 2 * math.pi - diff
-                        if diff < best_diff:
-                            best_diff = diff
-                            best_idx = idx
-                    
-                    if best_idx >= 0:
-                        used_indices.add(best_idx)
-                        _, coord = boundary_with_angle[best_idx]
-                        selected_boundaries.append(coord)
-                
-                for coord in selected_boundaries:
-                    r, c = coord
+                    diffs = np.abs(sorted_angles - target_angle)
+                    diffs = np.minimum(diffs, 2 * math.pi - diffs)
+                    diffs[used_sel] = float('inf')
+                    best_idx = int(np.argmin(diffs))
+                    used_sel[best_idx] = True
+                    selected_boundaries.append((int(sorted_coords[best_idx, 0]), int(sorted_coords[best_idx, 1])))
+
+                for r, c in selected_boundaries:
                     if dist_field_cpu[r, c] >= INF:
                         continue
-                    
-                    # Check against dilated batch_connected (accounts for bridge width)
                     if batch_connected_dilated[r, c]:
                         island_bridge_count += 1
                         continue
-                    
-                    # Trace path - terminate on dilated batch_connected
                     path = _trace_path_from_distance_cpu(r, c, dist_field_cpu, batch_connected_dilated)
-                    
                     if path and len(path) > 1:
                         island_bridge_count += 1
                         bridges_since_recompute += 1
-                        
                         if bridge_width > 1:
-                            draw_thick_path_into_mask(fill_layer_accums[fill_layer_idx], path, bridge_width, smooth, smooth_iterations)
-                            draw_thick_path_into_mask(all_bridges_accum, path, bridge_width, smooth, smooth_iterations)
-                            draw_thick_path_into_mask(connected_cpu, path, bridge_width, smooth, smooth_iterations)
-                            draw_thick_path_into_mask(batch_connected, path, bridge_width, smooth, smooth_iterations)
-                            # Update dilated version
-                            draw_thick_path_into_mask(batch_connected_dilated, path, bridge_width + bridge_dilation * 2, smooth, smooth_iterations)
+                            rs, cs = compute_thick_path_pixels(path, bridge_width, smooth, smooth_iterations, img_shape)
+                            if rs is not None:
+                                fill_layer_accums[fill_layer_idx][rs, cs] = True
+                                all_bridges_accum[rs, cs] = True
+                                connected_cpu[rs, cs] = True
+                                batch_connected[rs, cs] = True
+                            rs_d, cs_d = compute_thick_path_pixels(path, bridge_width + bridge_dilation * 2, smooth, smooth_iterations, img_shape)
+                            if rs_d is not None:
+                                batch_connected_dilated[rs_d, cs_d] = True
                         else:
                             draw_path_into_mask(fill_layer_accums[fill_layer_idx], path, smooth, smooth_iterations)
                             draw_path_into_mask(all_bridges_accum, path, smooth, smooth_iterations)
                             draw_path_into_mask(connected_cpu, path, smooth, smooth_iterations)
                             draw_path_into_mask(batch_connected, path, smooth, smooth_iterations)
                             batch_connected_dilated = batch_connected.copy()
-                        
-                        # Periodically recompute distance field to route around new bridges
                         if bridges_since_recompute >= recompute_interval:
                             connected_gpu = cp.asarray(connected_cpu)
                             dist_field_gpu = _gpu_compute_distance_field(connected_gpu, foreground, cp, cndi)
@@ -1616,65 +1612,47 @@ def generate_layers_gpu(
                                 batch_connected_dilated = ndi_cpu.binary_dilation(batch_connected, iterations=bridge_dilation)
                             else:
                                 batch_connected_dilated = batch_connected
-                
-                if island_bridge_count > 0:
-                    logging.debug("Island %d (size=%d) bridged with %d paths", 
-                                 label_id, len(island_coords_cpu), island_bridge_count)
-                else:
+
+                if island_bridge_count == 0:
                     failed_count += 1
-                    logging.debug("Island %d (size=%d) could not find any bridge path", 
-                                 label_id, len(island_coords_cpu))
             else:
-                # Single bridge - find boundary pixel with minimum distance
-                best_r, best_c = -1, -1
-                best_dist = INF
-                for coord in boundary_coords_cpu:
-                    r, c = int(coord[0]), int(coord[1])
-                    if dist_field_cpu[r, c] < best_dist:
-                        best_dist = dist_field_cpu[r, c]
-                        best_r, best_c = r, c
-                
-                if best_r < 0 or best_dist >= INF:
+                # Single bridge — vectorised best-dist lookup
+                b_rs = boundary_coords_cpu[:, 0]
+                b_cs = boundary_coords_cpu[:, 1]
+                b_dists = dist_field_cpu[b_rs, b_cs]
+                min_idx = int(np.argmin(b_dists))
+                best_dist = b_dists[min_idx]
+                if best_dist >= INF:
                     failed_count += 1
-                    logging.debug("Island %d (size=%d) could not find bridge path", 
-                                 label_id, len(island_coords_cpu))
                     continue
-                
-                # Check against dilated batch_connected (accounts for bridge width)
+                best_r, best_c = int(b_rs[min_idx]), int(b_cs[min_idx])
+
                 if batch_connected_dilated[best_r, best_c]:
-                    logging.debug("Island %d (size=%d) already connected to boundary", 
-                                 label_id, len(island_coords_cpu))
                     continue
-                
-                # Trace path - terminate on dilated batch_connected
+
                 path = _trace_path_from_distance_cpu(best_r, best_c, dist_field_cpu, batch_connected_dilated)
-                
                 if not path or len(path) < 2:
                     failed_count += 1
-                    logging.debug("Island %d (size=%d) could not trace bridge path", 
-                                 label_id, len(island_coords_cpu))
                     continue
-                
-                logging.debug("Island %d (size=%d) bridged with path of length %d", 
-                             label_id, len(island_coords_cpu), len(path))
-                
+
                 bridges_since_recompute += 1
-                
                 if bridge_width > 1:
-                    draw_thick_path_into_mask(fill_layer_accums[fill_layer_idx], path, bridge_width, smooth, smooth_iterations)
-                    draw_thick_path_into_mask(all_bridges_accum, path, bridge_width, smooth, smooth_iterations)
-                    draw_thick_path_into_mask(connected_cpu, path, bridge_width, smooth, smooth_iterations)
-                    draw_thick_path_into_mask(batch_connected, path, bridge_width, smooth, smooth_iterations)
-                    # Update dilated version
-                    draw_thick_path_into_mask(batch_connected_dilated, path, bridge_width + bridge_dilation * 2, smooth, smooth_iterations)
+                    rs, cs = compute_thick_path_pixels(path, bridge_width, smooth, smooth_iterations, img_shape)
+                    if rs is not None:
+                        fill_layer_accums[fill_layer_idx][rs, cs] = True
+                        all_bridges_accum[rs, cs] = True
+                        connected_cpu[rs, cs] = True
+                        batch_connected[rs, cs] = True
+                    rs_d, cs_d = compute_thick_path_pixels(path, bridge_width + bridge_dilation * 2, smooth, smooth_iterations, img_shape)
+                    if rs_d is not None:
+                        batch_connected_dilated[rs_d, cs_d] = True
                 else:
                     draw_path_into_mask(fill_layer_accums[fill_layer_idx], path, smooth, smooth_iterations)
                     draw_path_into_mask(all_bridges_accum, path, smooth, smooth_iterations)
                     draw_path_into_mask(connected_cpu, path, smooth, smooth_iterations)
                     draw_path_into_mask(batch_connected, path, smooth, smooth_iterations)
                     batch_connected_dilated = batch_connected.copy()
-                
-                # Periodically recompute distance field to route around new bridges
+
                 if bridges_since_recompute >= recompute_interval:
                     connected_gpu = cp.asarray(connected_cpu)
                     dist_field_gpu = _gpu_compute_distance_field(connected_gpu, foreground, cp, cndi)
@@ -1687,6 +1665,7 @@ def generate_layers_gpu(
                         batch_connected_dilated = ndi_cpu.binary_dilation(batch_connected, iterations=bridge_dilation)
                     else:
                         batch_connected_dilated = batch_connected
+
             
     # Structural bridges: computed on foreground AFTER regular bridges are removed.
     # They are NOT mixed into fill_layer_accums — they get their own dedicated layer.
