@@ -614,6 +614,7 @@ def generate_layers(
     bridges_per_island: int = 1,
     max_cutout_size: int = None,
     struct_progress_callback=None,  # Optional[Callable[[np.ndarray], None]]
+    clip_to_region: bool = False,
 ) -> Tuple[List[np.ndarray], List[str], np.ndarray, np.ndarray]:
     """
     Generate stencil layers that combine to form the original image.
@@ -774,7 +775,7 @@ def generate_layers(
             bridge_masks.append(path_mask)
         
     # Assign regular bridges to fill-in layers (layers 2..N)
-    fill_layers = layers - 1 if layers > 1 else 1
+    fill_layers = max(1, layers)
     bridge_assignments: List[List[int]] = [[] for _ in range(fill_layers)]
     for bridge_index in range(len(bridge_masks)):
         fill_layer = bridge_index % fill_layers
@@ -791,11 +792,11 @@ def generate_layers(
     structural_mask = np.zeros((height, width), dtype=bool)
     if max_cutout_size is not None:
         remaining_fg = foreground & ~all_regular_bridges
-        structural_masks = _compute_structural_bridges(remaining_fg, max_cutout_size, bridge_width, height, width, on_bridge=struct_progress_callback)
+        structural_masks = _compute_structural_bridges(remaining_fg, max_cutout_size, bridge_width, height, width, on_bridge=struct_progress_callback, clip_to_region=clip_to_region)
         for sm in structural_masks:
             structural_mask = structural_mask | sm
 
-    total_layers = layers + (1 if structural_masks else 0)
+    total_layers = 1 + fill_layers + (1 if structural_masks else 0)
     layer_images: List[np.ndarray] = []
 
     # Layer 1: full design + regular bridges + structural bridges (all solid)
@@ -842,6 +843,7 @@ def _compute_structural_bridges(
     height: int,
     width: int,
     on_bridge=None,  # Optional[Callable[[np.ndarray], None]]
+    clip_to_region: bool = False,
 ) -> List[np.ndarray]:
     """Iteratively split all foreground connected-components larger than
     *max_cutout_size* pixels by inserting bisecting chords.
@@ -928,16 +930,18 @@ def _compute_structural_bridges(
             if not chord_thin.any():
                 continue
 
-            # Dilate then clip (cropped)
+            # Dilate; optionally clip back to region
             if bridge_width > 1:
                 from scipy import ndimage as _ndi2
                 diam = 2 * bridge_width - 1
                 cy, cx = np.ogrid[:diam, :diam]
                 ctr = bridge_width - 1
                 struct = ((cx - ctr) ** 2 + (cy - ctr) ** 2) < bridge_width * bridge_width
-                mid_crop = _ndi2.binary_dilation(chord_thin, structure=struct) & rm_crop
+                mid_crop = _ndi2.binary_dilation(chord_thin, structure=struct)
             else:
-                mid_crop = chord_thin & rm_crop
+                mid_crop = chord_thin
+            if clip_to_region:
+                mid_crop = mid_crop & rm_crop
             if not mid_crop.any():
                 continue
 
@@ -1295,6 +1299,7 @@ def generate_layers_gpu(
     bridges_per_island: int = 1,
     max_cutout_size: int = None,
     struct_progress_callback=None,  # Optional[Callable[[np.ndarray], None]]
+    clip_to_region: bool = False,
 ) -> Tuple[List, List[str], Any, Any]:
     """
     GPU version: Generate stencil layers that combine to form the original image.
@@ -1464,7 +1469,7 @@ def generate_layers_gpu(
     island_slices = ndi_cpu.find_objects(labels_cpu)
     
     # Pre-allocate per-layer bridge accumulators
-    fill_layers = layers - 1 if layers > 1 else 1
+    fill_layers = max(1, layers)
     fill_layer_accums = [np.zeros((height_img, width_img), dtype=bool) for _ in range(fill_layers)]
     all_bridges_accum = np.zeros((height_img, width_img), dtype=bool)
     
@@ -1706,7 +1711,7 @@ def generate_layers_gpu(
         remaining_fg_cpu = foreground_cpu & ~all_bridges_accum
         for mid_mask_cpu in _compute_structural_bridges(
             remaining_fg_cpu, max_cutout_size, bridge_width, height_img, width_img,
-            on_bridge=struct_progress_callback
+            on_bridge=struct_progress_callback, clip_to_region=clip_to_region
         ):
             structural_accum |= mid_mask_cpu
 
@@ -1716,7 +1721,7 @@ def generate_layers_gpu(
     structural_gpu = cp.asarray(structural_accum)
     has_structural = bool(structural_accum.any())
 
-    total_layers = layers + (1 if has_structural else 0)
+    total_layers = 1 + fill_layers + (1 if has_structural else 0)
     layer_images: List = []
 
     # Layer 1: full design + regular bridges + structural bridges (all solid)
@@ -1767,7 +1772,7 @@ def parse_args() -> argparse.Namespace:
         description="Create multiple stencil layers to avoid holes while preserving the original silhouette when overlayed."
     )
     parser.add_argument("input", type=Path, help="Input image (PNG, BMP, JPEG, etc.)")
-    parser.add_argument("--layers", type=int, default=2, help="Number of stencil layers to generate")
+    parser.add_argument("--layers", type=int, default=2, help="Number of bridge fill layers (not counting the base layer and the structural fill layer)")
     parser.add_argument("--outdir", type=Path, default=Path("output"), help="Output directory")
     parser.add_argument("--invert", action="store_true", help="Invert input if white is foreground")
     parser.add_argument("--threshold", type=int, default=128, help="Threshold for binarization (0-255)")
@@ -1779,7 +1784,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-island-size", type=int, default=1, help="Minimum island size in pixels (smaller islands ignored)")
     parser.add_argument("--erode-passes", type=int, default=0, help="Erosion passes for island detection (higher = catches more diagonal/thin wall islands)")
     parser.add_argument("--bridges-per-island", type=int, default=1, help="Number of bridges per island (more = stronger stencil support)")
-    parser.add_argument("--max-cutout-size", type=int, default=None, help="Maximum background region size in pixels; islands larger than this get an extra structural midsection bridge to limit open cutout area")
+    parser.add_argument("--max-cutout-size", type=int, default=0, help="Maximum foreground region size in pixels; regions larger than this get structural bridges to limit open cutout area (0 = disabled)")
+    parser.add_argument("--structural-bridges", action=argparse.BooleanOptionalAction, default=True, help="Enable structural bridge subdivision to limit large cutout regions (default: on)")
+    parser.add_argument("--clip-structural", action="store_true", default=False, help="Clip dilated structural bridges back to their own region mask")
     parser.add_argument("--log", nargs='?', const="log.txt", default=None, metavar="FILE", help="Save console output to file (default: log.txt)")
     return parser.parse_args()
 
@@ -1788,7 +1795,9 @@ def main() -> None:
     args = parse_args()
 
     # Treat 0 (or negative) as "disabled" — same as omitting the flag
-    if args.max_cutout_size is not None and args.max_cutout_size <= 0:
+    if not args.structural_bridges:
+        args.max_cutout_size = None
+    elif args.max_cutout_size is not None and args.max_cutout_size <= 0:
         args.max_cutout_size = None
 
     # Set up logging
@@ -1820,7 +1829,7 @@ def main() -> None:
 
     # Build a callback that paints each new structural bridge in pink and saves
     # struct_bridges.png so progress is visible during a long run.
-    if args.max_cutout_size is not None:
+    if args.structural_bridges and args.max_cutout_size is not None:
         _sb_accum = np.zeros(foreground.shape, dtype=bool)
         _sb_path = args.outdir / "struct_bridges.png"
         def _struct_bridge_callback(mid_mask: np.ndarray) -> None:
@@ -1854,6 +1863,7 @@ def main() -> None:
             bridges_per_island=args.bridges_per_island,
             max_cutout_size=args.max_cutout_size,
             struct_progress_callback=_struct_cb,
+            clip_to_region=args.clip_structural,
         )
         layers = [cp.asnumpy(layer) for layer in layers]
         islands_mask = cp.asnumpy(islands_mask)
@@ -1871,11 +1881,24 @@ def main() -> None:
             bridges_per_island=args.bridges_per_island,
             max_cutout_size=args.max_cutout_size,
             struct_progress_callback=_struct_cb,
+            clip_to_region=args.clip_structural,
         )
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    for idx, layer in enumerate(layers, start=1):
-        out_path = args.outdir / f"layer_{idx:02d}.png"
+    # layers[0]  = base (full design + all bridges)
+    # layers[1..-2] = bridge fill-in (round-robin, may be empty)
+    # layers[-1] = structural fill (only when structural bridges were inserted)
+    has_structural_layer = bool(structural_mask.any())
+    save_binary_image(args.outdir / "layer_0_base.png", layers[0])
+    logging.info("Wrote layer_0_base.png")
+    if has_structural_layer and len(layers) > 1:
+        save_binary_image(args.outdir / "layer_1_structural.png", layers[-1])
+        logging.info("Wrote layer_1_structural.png")
+        bridge_layers = layers[1:-1]
+    else:
+        bridge_layers = layers[1:]
+    for i, layer in enumerate(bridge_layers, start=2):
+        out_path = args.outdir / f"layer_{i}_bridges.png"
         save_binary_image(out_path, layer)
         logging.info("Wrote %s", out_path)
 
@@ -1936,7 +1959,7 @@ def main() -> None:
     # structural.png: oversized regions (before structural bridges) in random colours + structural bridges in pink
     structural_path = args.outdir / "structural.png"
     structural_rgba = original_rgba.copy()
-    if args.max_cutout_size is not None:
+    if args.structural_bridges and args.max_cutout_size is not None:
         # Compute per-label sizes in one vectorized pass
         label_sizes = np.bincount(cut_labels.ravel(), minlength=cut_count + 1)
         oversized_lbls = np.where(label_sizes > args.max_cutout_size)[0]
@@ -1955,10 +1978,10 @@ def main() -> None:
             structural_rgba = blend_overlay(structural_rgba, structural_mask, (255, 105, 180), alpha=0.85)
         logging.info("Wrote %s (%d oversized region(s) + structural bridges in pink)", structural_path, oversized_count)
     else:
-        logging.info("Wrote %s (no max-cutout-size set)", structural_path)
+        logging.info("Wrote %s (structural bridges disabled or no max-cutout-size set)", structural_path)
     Image.fromarray(structural_rgba, mode="RGBA").save(structural_path)
 
-    if args.max_cutout_size is not None:
+    if args.structural_bridges and args.max_cutout_size is not None:
         sb_path = args.outdir / "struct_bridges.png"
         if sb_path.exists():
             logging.info("Wrote %s (incremental structural bridges in pink, one layer per iteration)", sb_path)
