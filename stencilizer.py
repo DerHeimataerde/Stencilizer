@@ -613,7 +613,6 @@ def generate_layers(
     erode_passes: int = 1,
     bridges_per_island: int = 1,
     max_cutout_size: int = None,
-    struct_progress_callback=None,  # Optional[Callable[[np.ndarray], None]]
     clip_to_region: bool = False,
 ) -> Tuple[List[np.ndarray], List[str], np.ndarray, np.ndarray]:
     """
@@ -792,7 +791,7 @@ def generate_layers(
     structural_mask = np.zeros((height, width), dtype=bool)
     if max_cutout_size is not None:
         remaining_fg = foreground & ~all_regular_bridges
-        structural_masks = _compute_structural_bridges(remaining_fg, max_cutout_size, bridge_width, height, width, on_bridge=struct_progress_callback, clip_to_region=clip_to_region)
+        structural_masks = _compute_structural_bridges(remaining_fg, max_cutout_size, bridge_width, height, width, clip_to_region=clip_to_region)
         for sm in structural_masks:
             structural_mask = structural_mask | sm
 
@@ -842,7 +841,6 @@ def _compute_structural_bridges(
     bridge_width: int,
     height: int,
     width: int,
-    on_bridge=None,  # Optional[Callable[[np.ndarray], None]]
     clip_to_region: bool = False,
 ) -> List[np.ndarray]:
     """Iteratively split all foreground connected-components larger than
@@ -989,7 +987,7 @@ def _compute_structural_bridges(
         # bridges (clipped to each region_mask) cannot affect one another.
         # Process all of them in a single pass and relabel only once per round.
         any_inserted = False
-        for fg_coords in oversized:
+        for fg_coords in tqdm(oversized, desc=f"Structural bridges (iter {iteration})", unit="region", leave=False):
             region_mask = np.zeros((height, width), dtype=bool)
             region_mask[fg_coords[:, 0], fg_coords[:, 1]] = True
             mid_mask = _best_chord(fg_coords, region_mask)
@@ -1000,8 +998,6 @@ def _compute_structural_bridges(
             working &= ~mid_mask
             any_inserted = True
             logging.debug("  region size=%d -> bridge inserted", len(fg_coords))
-            if on_bridge is not None:
-                on_bridge(mid_mask)
 
         if not any_inserted:
             logging.warning(
@@ -1298,7 +1294,6 @@ def generate_layers_gpu(
     erode_passes: int = 1,
     bridges_per_island: int = 1,
     max_cutout_size: int = None,
-    struct_progress_callback=None,  # Optional[Callable[[np.ndarray], None]]
     clip_to_region: bool = False,
 ) -> Tuple[List, List[str], Any, Any]:
     """
@@ -1490,7 +1485,7 @@ def generate_layers_gpu(
         if not layer_islands:
             continue
         
-        logging.info("Processing layer %d/%d (%d islands)...", fill_layer_idx + 2, layers, len(layer_islands))
+        logging.info("Bridge layer %d/%d (%d islands)...", fill_layer_idx + 1, fill_layers, len(layer_islands))
         
         # Initialize "connected" network for this layer: targets + border
         # As bridges are added, they become part of the connected network
@@ -1711,7 +1706,7 @@ def generate_layers_gpu(
         remaining_fg_cpu = foreground_cpu & ~all_bridges_accum
         for mid_mask_cpu in _compute_structural_bridges(
             remaining_fg_cpu, max_cutout_size, bridge_width, height_img, width_img,
-            on_bridge=struct_progress_callback, clip_to_region=clip_to_region
+            clip_to_region=clip_to_region
         ):
             structural_accum |= mid_mask_cpu
 
@@ -1827,21 +1822,6 @@ def main() -> None:
     original_img = Image.open(args.input).convert("RGBA")
     original_rgba = np.array(original_img)
 
-    # Build a callback that paints each new structural bridge in pink and saves
-    # struct_bridges.png so progress is visible during a long run.
-    if args.structural_bridges and args.max_cutout_size is not None:
-        _sb_accum = np.zeros(foreground.shape, dtype=bool)
-        _sb_path = args.outdir / "struct_bridges.png"
-        def _struct_bridge_callback(mid_mask: np.ndarray) -> None:
-            nonlocal _sb_accum
-            args.outdir.mkdir(parents=True, exist_ok=True)
-            _sb_accum |= mid_mask
-            img = blend_overlay(original_rgba, _sb_accum, (255, 105, 180), alpha=0.85)
-            Image.fromarray(img, mode="RGBA").save(_sb_path)
-        _struct_cb = _struct_bridge_callback
-    else:
-        _struct_cb = None
-
     smooth = not args.no_smooth and args.smooth_iterations > 0
     if args.gpu:
         try:
@@ -1862,7 +1842,6 @@ def main() -> None:
             erode_passes=args.erode_passes,
             bridges_per_island=args.bridges_per_island,
             max_cutout_size=args.max_cutout_size,
-            struct_progress_callback=_struct_cb,
             clip_to_region=args.clip_structural,
         )
         layers = [cp.asnumpy(layer) for layer in layers]
@@ -1880,7 +1859,6 @@ def main() -> None:
             erode_passes=args.erode_passes,
             bridges_per_island=args.bridges_per_island,
             max_cutout_size=args.max_cutout_size,
-            struct_progress_callback=_struct_cb,
             clip_to_region=args.clip_structural,
         )
 
@@ -1983,8 +1961,10 @@ def main() -> None:
 
     if args.structural_bridges and args.max_cutout_size is not None:
         sb_path = args.outdir / "struct_bridges.png"
-        if sb_path.exists():
-            logging.info("Wrote %s (incremental structural bridges in pink, one layer per iteration)", sb_path)
+        if structural_mask.any():
+            sb_rgba = blend_overlay(original_rgba, structural_mask, (255, 105, 180), alpha=0.85)
+            Image.fromarray(sb_rgba, mode="RGBA").save(sb_path)
+            logging.info("Wrote %s (structural bridges in pink)", sb_path)
         else:
             logging.info("No structural bridges were inserted (struct_bridges.png not created)")
 
