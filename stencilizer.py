@@ -858,6 +858,7 @@ def _compute_structural_bridges(
     """
     import math
     from scipy import ndimage as _ndi
+    from tqdm.contrib.logging import logging_redirect_tqdm as _lrt
     _structure_8 = np.ones((3, 3), dtype=bool)
     _structure_8_3 = np.ones((3, 3), dtype=bool)  # reused for cropped-box label checks
     working = foreground_np.copy()
@@ -964,50 +965,51 @@ def _compute_structural_bridges(
         full[wr0:wr1, wc0:wc1] = crop_mask
         return full
 
-    for iteration in range(1, max_iterations + 1):
-        labels, count = _ndi.label(working, structure=_structure_8)
-        oversized = sorted(
-            [np.argwhere(labels == lbl)
-             for lbl in range(1, count + 1)
-             if (labels == lbl).sum() > max_cutout_size],
-            key=len, reverse=True,
-        )
-        if not oversized:
+    with _lrt():
+        for iteration in range(1, max_iterations + 1):
+            labels, count = _ndi.label(working, structure=_structure_8)
+            oversized = sorted(
+                [np.argwhere(labels == lbl)
+                 for lbl in range(1, count + 1)
+                 if (labels == lbl).sum() > max_cutout_size],
+                key=len, reverse=True,
+            )
+            if not oversized:
+                logging.info(
+                    "max-cutout-size: done after %d iteration(s), all regions within threshold",
+                    iteration - 1,
+                )
+                break
             logging.info(
-                "max-cutout-size: done after %d iteration(s), all regions within threshold",
-                iteration - 1,
+                "max-cutout-size iteration %d: %d region(s) above %d px",
+                iteration, len(oversized), max_cutout_size,
             )
-            break
-        logging.info(
-            "max-cutout-size iteration %d: %d region(s) above %d px",
-            iteration, len(oversized), max_cutout_size,
-        )
-        # All oversized regions are disjoint connected components, so their
-        # bridges (clipped to each region_mask) cannot affect one another.
-        # Process all of them in a single pass and relabel only once per round.
-        any_inserted = False
-        for fg_coords in tqdm(oversized, desc=f"Structural bridges (iter {iteration})", unit="region", leave=True):
-            region_mask = np.zeros((height, width), dtype=bool)
-            region_mask[fg_coords[:, 0], fg_coords[:, 1]] = True
-            mid_mask = _best_chord(fg_coords, region_mask)
-            if mid_mask is None:
-                logging.debug("  region size=%d -> no chord found, skipping", len(fg_coords))
-                continue
-            bridges.append(mid_mask)
-            working &= ~mid_mask
-            any_inserted = True
-            logging.debug("  region size=%d -> bridge inserted", len(fg_coords))
+            # All oversized regions are disjoint connected components, so their
+            # bridges (clipped to each region_mask) cannot affect one another.
+            # Process all of them in a single pass and relabel only once per round.
+            any_inserted = False
+            for fg_coords in tqdm(oversized, desc=f"Structural bridges (iter {iteration})", unit="region", leave=True):
+                region_mask = np.zeros((height, width), dtype=bool)
+                region_mask[fg_coords[:, 0], fg_coords[:, 1]] = True
+                mid_mask = _best_chord(fg_coords, region_mask)
+                if mid_mask is None:
+                    logging.debug("  region size=%d -> no chord found, skipping", len(fg_coords))
+                    continue
+                bridges.append(mid_mask)
+                working &= ~mid_mask
+                any_inserted = True
+                logging.debug("  region size=%d -> bridge inserted", len(fg_coords))
 
-        if not any_inserted:
+            if not any_inserted:
+                logging.warning(
+                    "max-cutout-size: no chord could be inserted for any oversized region; stopping"
+                )
+                break
+        else:
             logging.warning(
-                "max-cutout-size: no chord could be inserted for any oversized region; stopping"
+                "max-cutout-size hit iteration cap (%d), some regions may still be oversized",
+                max_iterations,
             )
-            break
-    else:
-        logging.warning(
-            "max-cutout-size hit iteration cap (%d), some regions may still be oversized",
-            max_iterations,
-        )
     return bridges
 
 
