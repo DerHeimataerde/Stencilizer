@@ -1864,22 +1864,24 @@ def main() -> None:
         )
 
     args.outdir.mkdir(parents=True, exist_ok=True)
+    layers_dir = args.outdir / "layers"
+    layers_dir.mkdir(parents=True, exist_ok=True)
     # layers[0]  = base (full design + all bridges)
     # layers[1..-2] = bridge fill-in (round-robin, may be empty)
     # layers[-1] = structural fill (only when structural bridges were inserted)
     has_structural_layer = bool(structural_mask.any())
-    save_binary_image(args.outdir / "layer_0_base.png", layers[0])
-    logging.info("Wrote layer_0_base.png")
+    save_binary_image(layers_dir / "layer_0_base.png", layers[0])
+    logging.info("Wrote layers/layer_0_base.png")
     if has_structural_layer and len(layers) > 1:
-        save_binary_image(args.outdir / "layer_1_structural.png", layers[-1])
-        logging.info("Wrote layer_1_structural.png")
+        save_binary_image(layers_dir / "layer_1_structural.png", layers[-1])
+        logging.info("Wrote layers/layer_1_structural.png")
         bridge_layers = layers[1:-1]
     else:
         bridge_layers = layers[1:]
     for i, layer in enumerate(bridge_layers, start=2):
-        out_path = args.outdir / f"layer_{i}_bridges.png"
+        out_path = layers_dir / f"layer_{i}_bridges.png"
         save_binary_image(out_path, layer)
-        logging.info("Wrote %s", out_path)
+        logging.info("Wrote layers/%s", out_path.name)
 
     islands_path = args.outdir / "islands.png"
     islands_rgba = blend_overlay(original_rgba, islands_mask, (0, 255, 0))  # Green for islands
@@ -1974,7 +1976,7 @@ def main() -> None:
         for w in warnings:
             logging.warning("- %s", w)
 
-    logging.info("Done. Wrote %d layer(s) to %s", len(layers), args.outdir)
+    logging.info("Done. Wrote %d layer(s) to %s", len(layers), layers_dir)
 
 
 if __name__ == "__main__":

@@ -63,9 +63,9 @@ The following files are written to the output directory:
 
 | File | Description |
 |------|-------------|
-| ``layer_0_base.png`` | Base layer: full design with all bridges solid (use first when painting) |
-| ``layer_1_structural.png`` | Structural fill layer: holes at structural bridge locations (only when structural bridges are inserted) |
-| ``layer_2_bridges.png``, ``layer_3_bridges.png``, ... | Bridge fill layers: holes at regular bridge locations (round-robin across ``--layers`` layers) |
+| ``layers/layer_0_base.png`` | Base layer: full design with all bridges solid (use first when painting) |
+| ``layers/layer_1_structural.png`` | Structural fill layer: holes at structural bridge locations (only when structural bridges are inserted) |
+| ``layers/layer_2_bridges.png``, ``layers/layer_3_bridges.png``, ... | Bridge fill layers: holes at regular bridge locations (round-robin across ``--layers`` layers) |
 | ``combined.png`` | Combined result of all layers overlaid |
 | ``islands.png`` | Detected islands (green) overlayed on original |
 | ``bridges.png`` | All bridges (blue) overlayed on original |
@@ -77,9 +77,9 @@ The following files are written to the output directory:
 
 ### Layer order when painting
 
-1. **``layer_0_base``** - paint first. All bridge and structural gaps are solid here.
-2. **``layer_1_structural``** *(if structural bridges were inserted)* - fills in structural bridge gaps.
-3. **``layer_2_bridges``**, **``layer_3_bridges``**, ... - fill in regular bridge gaps, one layer per ``--layers`` value.
+1. **``layers/layer_0_base``** - paint first. All bridge and structural gaps are solid here.
+2. **``layers/layer_1_structural``** *(if structural bridges were inserted)* - fills in structural bridge gaps.
+3. **``layers/layer_2_bridges``**, **``layers/layer_3_bridges``**, ... - fill in regular bridge gaps, one layer per ``--layers`` value.
 
 Overlaying all layers in this order reconstructs the complete original silhouette.
 
