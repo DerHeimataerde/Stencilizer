@@ -135,7 +135,7 @@ $$s_i = r_i \cdot \hat{n}_r + c_i \cdot \hat{n}_c$$
 
 Place the chord at $s = \text{median}(\{s_i\})$. This choice is optimal for balanced splitting: by definition of the median, roughly half the pixels have $s_i \leq \text{median}$ and half have $s_i \geq \text{median}$, regardless of whether the region is convex or concave, and regardless of whether the centroid lies inside the region (it may not for C- or U-shaped regions).
 
-The chord spine consists of pixels within a tolerance of the median line. Tolerance is set to $\max(0.5,\ \text{d}_\text{min} + 0.5)$ where $\text{d}_\text{min}$ is the minimum distance any pixel has to the median — this ensures at least one pixel is selected even if the projection distribution is discrete and sparse. Chord endpoints are the extremes of the spine projected along $\hat{c}$.
+The chord spine consists of pixels within a tolerance of the median line. Tolerance is set to $\max(0.5,\, d_{\min} + 0.5)$ where $d_{\min}$ is the minimum distance any pixel has to the median — this ensures at least one pixel is selected even if the projection distribution is discrete and sparse. Chord endpoints are the extremes of the spine projected along $\hat{c}$.
 
 The chord is then rasterised (Bresenham), dilated to `bridge_width`, and its effect tested: if removing it yields ≥ 2 connected components in the cropped bounding box, it is a **clean split**. All work is done inside the region's bounding box (plus `bridge_width + 1` padding for dilation), so cost is O(region area), not O(image area).
 
