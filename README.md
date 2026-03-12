@@ -217,9 +217,10 @@ python stencilizer.py input.png --layers 2 --outdir output --gpu --min-island-si
 | ``--min-island-size`` | 1 | Minimum island size in pixels (smaller ignored) |
 | ``--erode-passes`` | 0 | Erosion passes for island detection (higher = catches more diagonal/thin wall islands) |
 | ``--bridges-per-island`` | 1 | Number of bridges per island (more = stronger support) |
-| ``--structural-bridges`` / ``--no-structural-bridges`` | on | Enable/disable structural bridge subdivision for large cutout regions |
 | ``--max-cutout-size`` | 0 (disabled) | Max foreground region size in pixels before a structural bridge is inserted to split it (0 = disabled) |
+| ``--structural-bridge-width`` | 0 | Width in pixels for structural bridges (0 = no dilation, chord clipped to region mask) |
 | ``--clip-structural`` | off | Clip dilated structural bridges back to their own region mask |
+| ``--format`` | png | Output file format for layer images (``png``, ``bmp``, ``tiff``, ``jpeg``, ``webp``) |
 | ``--gpu`` | off | Use GPU acceleration via CuPy |
 | ``--verbose`` | off | Enable verbose logging |
 | ``--log`` | off | Save console output to file (default: log.txt) |
@@ -230,10 +231,10 @@ The following files are written to the output directory:
 
 | File | Description |
 |------|-------------|
-| ``layers/layer_0_base.png`` | Base layer: full design with all bridges solid (use first when painting) |
-| ``layers/layer_1_structural.png`` | Structural fill layer: holes at structural bridge locations (only when structural bridges are inserted) |
-| ``layers/layer_2_bridges.png``, ``layers/layer_3_bridges.png``, ... | Bridge fill layers: holes at regular bridge locations (round-robin across ``--layers`` layers) |
-| ``combined.png`` | Combined result of all layers overlaid |
+| ``layers/layer_0_base.<ext>`` | Base layer: full design with all bridges solid (use first when painting) |
+| ``layers/layer_1_structural.<ext>`` | Structural fill layer: holes at structural bridge locations (only when structural bridges are inserted) |
+| ``layers/layer_2_bridges.<ext>``, ``layers/layer_3_bridges.<ext>``, ... | Bridge fill layers: holes at regular bridge locations (round-robin across ``--layers`` layers) |
+| ``combined.<ext>`` | Combined result of all layers overlaid |
 | ``islands.png`` | Detected islands (green) overlayed on original |
 | ``bridges.png`` | All bridges (blue) overlayed on original |
 | ``cutouts.png`` | Foreground regions after regular bridges, each in a random colour |
